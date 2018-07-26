@@ -824,7 +824,7 @@ object ImmGen {
 }
 
 object RVFIMonitor {
-  class RVFI_Base(xlen: Integer) extends Bundle {
+  class RVFI_Base(xlen: Integer)(implicit p: Parameters) extends Bundle {
     val valid = UInt(width=1)
     val order = UInt(width=64)
     val insn = UInt(width=32)
@@ -845,10 +845,17 @@ object RVFIMonitor {
     val mem_wmask = UInt(width=xlen/8)
     val mem_rdata = UInt(width=xlen)
     val mem_wdata = UInt(width=xlen)
+
+//    val csr = (new CSRFileIO).asOutput
+    val mcycle = UInt(width=xlen)
+
+    val retireWidth = p(TileKey).core.retireWidth
+    val retire = UInt(INPUT, log2Up(1+retireWidth))
+
     override def cloneType: this.type = new RVFI_Base(xlen).asInstanceOf[this.type]
   }
 
-  def invalid_RVFI_base(xlen: Integer): RVFI_Base = {
+  def invalid_RVFI_base(xlen: Integer)(implicit p: Parameters): RVFI_Base = {
     val ret_interface = Wire(new RVFI_Base(xlen))
     ret_interface.valid := Bool(false)
     ret_interface
@@ -856,8 +863,10 @@ object RVFIMonitor {
 }
 
 class RVFIMonitor(implicit p: Parameters) extends BlackBox {
-  val xlen = p(XLen)
   val nret = 2
+
+  val xlen = p(XLen)
+  val retireWidth = p(TileKey).core.retireWidth
 
   val io = IO(new Bundle {
     val clock = Clock(INPUT)
@@ -882,6 +891,10 @@ class RVFIMonitor(implicit p: Parameters) extends BlackBox {
     val rvfi_mem_wmask = UInt(INPUT, width=nret*xlen/8)
     val rvfi_mem_rdata = UInt(INPUT, width=nret*xlen)
     val rvfi_mem_wdata = UInt(INPUT, width=nret*xlen)
+
+//    val csr_status = UInt(INPUT, width=nret*xlen)
+    val csr_mcycle = UInt(INPUT, width=nret*xlen)
+    val csr_instret =  UInt(INPUT, width=nret*(log2Up(1+retireWidth)))
     val errcode = UInt(OUTPUT, width=16)
   })
 
@@ -908,6 +921,10 @@ class RVFIMonitor(implicit p: Parameters) extends BlackBox {
     io.rvfi_mem_wmask := content.map(_.mem_wmask).asUInt
     io.rvfi_mem_rdata := content.map(_.mem_rdata).asUInt
     io.rvfi_mem_wdata := content.map(_.mem_wdata).asUInt
+
+//    io.csr_status := content.map(_.csr.status).asUInt
+    io.csr_mcycle := content.map(_.mcycle).asUInt
+    io.csr_instret := content.map(_.retire).asUInt
   }
 }
 
@@ -930,6 +947,34 @@ class RocketWithRVFI(implicit p: Parameters) extends Rocket()(p) {
 
   val inst_order = RegInit(UInt(0, width=64))
 
+  val ex_csr_reg = Reg((new CSRFileIO).asOutput).suggestName("ex_csr_reg")
+  val mem_csr_reg = Reg((new CSRFileIO).asOutput).suggestName("mem_csr_reg")
+  val wb_csr_reg = Reg((new CSRFileIO).asOutput).suggestName("wb_csr_reg")
+
+  val csr_ex_mcycle_reg = Reg(UInt(width=xLen))
+  val csr_mem_mcycle_reg = Reg(UInt(width=xLen))
+  val csr_wb_mcycle_reg = Reg(UInt(width=xLen))
+
+  val csr_ex_instret_reg = Reg(UInt(width=log2Up(1+retireWidth)))
+  val csr_mem_instret_reg = Reg(UInt(width=log2Up(1+retireWidth)))
+  val csr_wb_instret_reg = Reg(UInt(width=log2Up(1+retireWidth)))
+
+// should be the exact same code as the line above where ex_reg_inst := id_inst(0)
+  when (!ctrl_killd || csr.io.interrupt || ibuf.io.inst(0).bits.replay) {
+//    ex_csr_reg := csr.io
+    csr_ex_mcycle_reg := csr.io.time
+    csr_ex_instret_reg := csr.io.retire
+  }
+//  mem_csr_reg := ex_csr_reg
+  csr_mem_mcycle_reg := csr_ex_mcycle_reg
+  csr_mem_instret_reg := csr_ex_instret_reg
+  when (mem_pc_valid) {
+//    wb_csr_reg := mem_csr_reg
+    csr_wb_mcycle_reg := csr_mem_mcycle_reg
+    csr_wb_instret_reg := csr_mem_instret_reg
+  }
+
+
   val xpt_encountered_nxt = Wire(Bool())
   val xpt_encountered = Reg(init=false.B, next=xpt_encountered_nxt)
   xpt_encountered_nxt := xpt_encountered
@@ -947,6 +992,8 @@ class RocketWithRVFI(implicit p: Parameters) extends Rocket()(p) {
                                                   mem_npc))).asSInt
   inst_commit.insn := t.insn
   inst_commit.order := UInt(0)
+//  inst_commit.csr := wb_csr_reg
+  inst_commit.mcycle := csr_wb_mcycle_reg
   inst_commit.mem_extamo := UInt(0)
   // Interrupt should be raised on the first instruction of the interrupt handler
   inst_commit.intr := xpt_encountered
